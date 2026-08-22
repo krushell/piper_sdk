@@ -48,7 +48,7 @@ POLICY_INIT_JOINT_POS = (
 DEFAULT_TARGET_POS_B = (0.30474148, 0.0, 0.29298553)
 POSE_COMMAND_RANGES = (
     (0.4, 0.7), # radius
-    (-0.5, 1.2), # pitch
+    (0.0, 1.2), # pitch
     (-1.0, 1.0), # yaw
 )
 
@@ -61,7 +61,8 @@ POLICY_CONTROL_PERIOD = SIMULATION_DT * SIMULATION_DECIMATION
 SINGLE_OBSERVATION_DIM = 27
 OBS_HISTORY_LENGTH = 5
 SPEED_PERCENT = 5
-MOTION_TIMEOUT = 20.0
+MOTION_TIMEOUT = 25.0
+TARGET_REACHED_KEYPOINT_ERROR_M = 0.02
 
 
 class ArmPolicy(torch.nn.Module):
@@ -137,6 +138,7 @@ class Manipulation:
         self.arm_joint_pos = torch.zeros(6, dtype=torch.float32,device=self.device)
         self.arm_joint_vel = torch.zeros(6, dtype=torch.float32,device=self.device)
         self.arm_last_action = torch.zeros(6, dtype=torch.float32,device=self.device)
+        self.arm_command_action = torch.zeros_like(self.arm_last_action)
         self.default_arm_joint_pos = torch.tensor(
             POLICY_INIT_JOINT_POS, dtype=torch.float32, device=self.device
         )
@@ -145,6 +147,12 @@ class Manipulation:
             JOINT_LIMITS_RAD, dtype=torch.float32, device=self.device
         )
         self._next_observation_deadline: float | None = None
+        self._previous_joint_feedback_timestamp_s: float | None = None
+        self.motor_speed_average_start_timestamp_s = 0.0
+        self.motor_speed_average_end_timestamp_s = 0.0
+        self.motor_speed_average_window_s = POLICY_CONTROL_PERIOD
+        self.motor_speed_average_sample_counts = (0,) * 6
+        self.motor_speed_latest_rad_s = (0.0,) * 6
         self.target_pos_b = torch.zeros(3, dtype=torch.float32,device=self.device)
         self.pose_command_b = torch.zeros(7, dtype=torch.float32,device=self.device)
         self.current_ee_pose_b = torch.zeros_like(self.pose_command_b)
@@ -296,6 +304,54 @@ class Manipulation:
             (self.target_keypoints_b - self.current_ee_keypoints_b).reshape(-1)
         )
 
+    def print_target_status(self) -> bool:
+        """Refresh feedback and print the final target-reaching result once."""
+        self.update_feedback_observation()
+
+        position_error_m = torch.linalg.vector_norm(
+            self.pose_command_b[:3] - self.current_ee_pose_b[:3]
+        )
+        target_quat = torch.nn.functional.normalize(
+            self.pose_command_b[3:], dim=0
+        )
+        current_quat = torch.nn.functional.normalize(
+            self.current_ee_pose_b[3:], dim=0
+        )
+        quat_dot = torch.clamp(
+            torch.abs(torch.dot(target_quat, current_quat)), max=1.0
+        )
+        orientation_error_deg = torch.rad2deg(2.0 * torch.acos(quat_dot))
+        keypoint_rms_m = (
+            torch.linalg.vector_norm(self.keypoint_error_command_b)
+            / math.sqrt(self.target_keypoints_b.shape[0])
+        )
+        position_error_mm = position_error_m.item() * 1000.0
+        orientation_error_deg_value = orientation_error_deg.item()
+        keypoint_rms_mm = keypoint_rms_m.item() * 1000.0
+        reached = keypoint_rms_mm <= TARGET_REACHED_KEYPOINT_ERROR_M * 1000.0
+
+        target_pose = self.pose_command_b.detach().cpu().tolist()
+        current_pose = self.current_ee_pose_b.detach().cpu().tolist()
+        target_pose_format = (
+            "[" + ", ".join(f"{value:.6f}" for value in target_pose) + "]"
+        )
+        current_pose_format = (
+            "[" + ", ".join(f"{value:.6f}" for value in current_pose) + "]"
+        )
+        pose_fields = "[x, y, z, qw, qx, qy, qz]（位置单位 m）"
+        print(f"目标位姿_b {pose_fields}: {target_pose_format}")
+        print(f"当前位姿_b {pose_fields}: {current_pose_format}")
+        print(
+            f"是否到达目标: {'是' if reached else '否'} "
+            f"(关键点 RMS 阈值 {TARGET_REACHED_KEYPOINT_ERROR_M * 1000.0:.1f} mm)"
+        )
+        print(
+            f"目标误差: 位置 {position_error_mm:.3f} mm, "
+            f"姿态 {orientation_error_deg_value:.3f}°, "
+            f"关键点 RMS {keypoint_rms_mm:.3f} mm"
+        )
+        return reached
+
 
     def compute_keypoints_b(
         self,
@@ -407,6 +463,9 @@ class Manipulation:
         self.arm_joint_pos_target.clamp_(
             self.arm_joint_limits_rad[:, 0], self.arm_joint_limits_rad[:, 1]
         )
+        self.arm_command_action.copy_(
+            (self.arm_joint_pos_target - self.default_arm_joint_pos) / ACTION_SCALE
+        )
 
         joint_msg = self.piper.GetArmJointMsgs()
         status_msg = self.piper.GetArmStatus()
@@ -449,8 +508,56 @@ class Manipulation:
         self.update_feedback_observation()
         return self.arm_history_obs_buf.clone()
 
+    def _read_motor_speed_observation(
+        self, joint_feedback_timestamp_s: float
+    ) -> tuple[object, tuple[float, ...]]:
+        window_end = float(joint_feedback_timestamp_s)
+        if not math.isfinite(window_end) or window_end <= 0.0:
+            window_end = time.time()
+
+        previous_timestamp = self._previous_joint_feedback_timestamp_s
+        is_initial_observation = previous_timestamp is None
+        elapsed = (
+            window_end - previous_timestamp
+            if not is_initial_observation
+            else 0.0
+        )
+        if not 0.5 * POLICY_CONTROL_PERIOD <= elapsed <= 2.0 * POLICY_CONTROL_PERIOD:
+            window_start = window_end - POLICY_CONTROL_PERIOD
+        else:
+            window_start = previous_timestamp
+
+        averaged = self.piper.GetArmHighSpdInfoAverage(window_start, window_end)
+        self._previous_joint_feedback_timestamp_s = window_end
+        self.motor_speed_average_start_timestamp_s = averaged.start_time
+        self.motor_speed_average_end_timestamp_s = averaged.end_time
+        self.motor_speed_average_window_s = averaged.end_time - averaged.start_time
+        self.motor_speed_average_sample_counts = averaged.sample_count
+
+        latest_motors = tuple(
+            getattr(averaged.latest, f"motor_{index}") for index in range(1, 7)
+        )
+        self.motor_speed_latest_rad_s = tuple(
+            motor.motor_speed * 0.001 for motor in latest_motors
+        )
+        missing_motors = [
+            index
+            for index, sample_count in enumerate(averaged.sample_count, start=1)
+            if sample_count == 0
+        ]
+        if missing_motors and not is_initial_observation:
+            raise RuntimeError(
+                "策略速度平均窗口内缺少高速电机反馈："
+                f"joints={missing_motors}, counts={averaged.sample_count}, "
+                f"window={self.motor_speed_average_window_s:.6f}s"
+            )
+
+        averaged_rad_s = tuple(speed * 0.001 for speed in averaged.motor_speed)
+        return averaged.latest, averaged_rad_s
+
     def update_feedback_observation(self) -> None:
-        joint_state = self.piper.GetArmJointMsgs().joint_state
+        joint_msg = self.piper.GetArmJointMsgs()
+        joint_state = joint_msg.joint_state
         joint_pos = (
             joint_state.joint_1, joint_state.joint_2, joint_state.joint_3,
             joint_state.joint_4, joint_state.joint_5, joint_state.joint_6,
@@ -459,13 +566,12 @@ class Manipulation:
             torch.tensor(joint_pos, dtype=torch.float32, device=self.device)
             * (math.pi / 180000.0)
         )
-        motor_high = self.piper.GetArmHighSpdInfoSnapshot()
+        _, averaged_motor_speed_rad_s = self._read_motor_speed_observation(
+            joint_msg.time_stamp
+        )
         self.arm_joint_vel.copy_(
             torch.tensor(
-                tuple(
-                    getattr(motor_high, f"motor_{i}").motor_speed * 0.001
-                    for i in range(1, 7)
-                ),
+                averaged_motor_speed_rad_s,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -657,13 +763,19 @@ if __name__ == "__main__":
         default="cpu",
         help="Policy inference device, for example cpu or cuda:0",
     )
-    parser.add_argument(
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--target_pos_b",
         type=float,
         nargs=3,
         metavar=("X", "Y", "Z"),
-        default=DEFAULT_TARGET_POS_B,
+        default=None,
         help="Target ee_gripper position in command frame, in meters",
+    )
+    target_group.add_argument(
+        "--random_target",
+        action="store_true",
+        help="Randomly sample one target pose from the training ranges",
     )
     parser.add_argument(
         "--run_policy",
@@ -682,11 +794,18 @@ if __name__ == "__main__":
     if args.policy_steps < 0:
         parser.error("--policy_steps must be non-negative")
 
+    if args.random_target:
+        target_pos_b = None
+    elif args.target_pos_b is not None:
+        target_pos_b = args.target_pos_b
+    else:
+        target_pos_b = DEFAULT_TARGET_POS_B
+
     manipulation = Manipulation(
         checkpoint_path=args.checkpoint_path,
         device=args.device,
         can_name=args.can_name,
-        target_pos_b=args.target_pos_b,
+        target_pos_b=target_pos_b,
     )
     if args.run_policy:
         try:
@@ -696,5 +815,8 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("用户中断 policy 控制")
         finally:
-            if manipulation.control_started:
-                manipulation.quick_stop()
+            try:
+                manipulation.print_target_status()
+            finally:
+                if manipulation.control_started:
+                    manipulation.quick_stop()

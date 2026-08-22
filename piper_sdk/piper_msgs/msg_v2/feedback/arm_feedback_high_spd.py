@@ -69,7 +69,8 @@ class ArmMsgFeedbackHighSpd:
                  motor_speed: int = 0, 
                  current: int = 0, 
                  pos: int = 0,
-                 effort: float = 0
+                 effort: float = 0,
+                 time_stamp: float = 0,
                  ):
         if can_id not in [0x000, 0x251, 0x252, 0x253, 0x254, 0x255, 0x256]:
             raise ValueError(f"'can_id' Value {can_id} out of range [0x000, 0x251, 0x252, 0x253, 0x254, 0x255, 0x256]")
@@ -80,6 +81,7 @@ class ArmMsgFeedbackHighSpd:
         self.current = current
         self.pos = pos
         self.effort = effort
+        self.time_stamp = time_stamp
     
     def cal_effort(self, current: int = None)-> float:
         current_ = 0
@@ -102,6 +104,7 @@ class ArmMsgFeedbackHighSpd:
                 f"  current: {self.current}\n"
                 f"  pos: {self.pos}\n"
                 f"  effort: {self.effort}\n"
+                f"  time_stamp: {self.time_stamp}\n"
                 f")")
 
     def __repr__(self):

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*-coding:utf8-*-
 
+import copy
 import time
 import can
+from collections import deque
 from can.message import Message
 from typing import (
     Optional,
@@ -23,6 +25,71 @@ from ..utils import logger, global_area
 from ..piper_param import *
 from ..version import PiperSDKVersion
 from .interface_version import InterfaceVersion
+
+
+_MOTOR_SPEED_HISTORY_SIZE = 512
+
+
+def _calculate_motor_speed_window_average(
+    samples,
+    start_time: float,
+    end_time: float,
+    fallback_speed: float,
+):
+    """Return a causal, timestamp-weighted average over one time window."""
+    if end_time <= start_time:
+        raise ValueError("end_time must be greater than start_time")
+    if not samples:
+        return float(fallback_speed), 0
+
+    samples_through_end = [sample for sample in samples if sample[0] <= end_time]
+    if not samples_through_end:
+        return float(fallback_speed), 0
+
+    fresh_sample_count = sum(
+        start_time < timestamp <= end_time
+        for timestamp, _ in samples_through_end
+    )
+
+    sample_before_start = None
+    sample_after_start = None
+    for sample in samples_through_end:
+        if sample[0] <= start_time:
+            sample_before_start = sample
+        else:
+            sample_after_start = sample
+            break
+
+    if sample_before_start is None:
+        if sample_after_start is None:
+            start_speed = float(fallback_speed)
+        else:
+            start_speed = float(sample_after_start[1])
+    elif sample_after_start is None:
+        start_speed = float(sample_before_start[1])
+    else:
+        before_time, before_speed = sample_before_start
+        after_time, after_speed = sample_after_start
+        interpolation = (start_time - before_time) / (after_time - before_time)
+        start_speed = before_speed + interpolation * (after_speed - before_speed)
+
+    integration_points = [(start_time, start_speed)]
+    integration_points.extend(
+        (timestamp, float(speed))
+        for timestamp, speed in samples_through_end
+        if start_time < timestamp < end_time
+    )
+    end_speed = float(samples_through_end[-1][1])
+    integration_points.append((end_time, end_speed))
+
+    integral = 0.0
+    previous_time, previous_speed = integration_points[0]
+    for timestamp, speed in integration_points[1:]:
+        integral += 0.5 * (previous_speed + speed) * (timestamp - previous_time)
+        previous_time = timestamp
+        previous_speed = speed
+    return integral / (end_time - start_time), fresh_sample_count
+
 
 class C_PiperInterface_V2():
     '''
@@ -130,6 +197,23 @@ class C_PiperInterface_V2():
                     f"motor_4:{self.motor_4}\n"
                     f"motor_5:{self.motor_5}\n"
                     f"motor_6:{self.motor_6}\n")
+
+    class ArmMotorSpeedWindowAverage():
+        '''Timestamp-weighted motor speeds over one caller-defined window.'''
+
+        def __init__(
+            self,
+            start_time: float,
+            end_time: float,
+            motor_speed,
+            sample_count,
+            latest,
+        ):
+            self.start_time = start_time
+            self.end_time = end_time
+            self.motor_speed = motor_speed
+            self.sample_count = sample_count
+            self.latest = latest
     
     class ArmMotorDriverInfoLowSpd():
         '''
@@ -499,6 +583,9 @@ class C_PiperInterface_V2():
 
         self.__arm_motor_info_high_spd_mtx = threading.Lock()
         self.__arm_motor_info_high_spd = self.ArmMotorDriverInfoHighSpd()
+        self.__arm_motor_speed_history = tuple(
+            deque(maxlen=_MOTOR_SPEED_HISTORY_SIZE) for _ in range(6)
+        )
 
         self.__arm_motor_info_low_spd_mtx = threading.Lock()
         self.__arm_motor_info_low_spd = self.ArmMotorDriverInfoLowSpd()
@@ -1096,6 +1183,70 @@ class C_PiperInterface_V2():
                                                                             self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_5'),
                                                                             self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_6'))
             return self.__arm_motor_info_high_spd
+
+    def GetArmHighSpdInfoSnapshot(self):
+        '''Return an atomic copy of all six high-speed motor payloads.
+
+        The regular getter returns the SDK's live aggregate object.  Its six
+        motors are updated by independent CAN frames, so callers that need to
+        compare samples over time must retain a snapshot rather than a mutable
+        reference to that object.
+        '''
+        with self.__arm_motor_info_high_spd_mtx:
+            self.__arm_motor_info_high_spd.Hz = self.__fps_counter.cal_average(
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_1'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_2'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_3'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_4'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_5'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_6')
+            )
+            return copy.deepcopy(self.__arm_motor_info_high_spd)
+
+    def GetArmHighSpdInfoAverage(self, start_time: float, end_time: float):
+        '''Return motor speeds averaged over ``[start_time, end_time]``.
+
+        The CAN timestamps use wall-clock seconds.  ``motor_speed`` remains in
+        the SDK's native 0.001 rad/s unit.  ``sample_count`` reports how many
+        new frames for each motor fell in ``(start_time, end_time]``.  The
+        ``latest`` field is an atomic high-speed feedback snapshot.
+        '''
+        start_time = float(start_time)
+        end_time = float(end_time)
+        if not math.isfinite(start_time) or not math.isfinite(end_time):
+            raise ValueError("start_time and end_time must be finite")
+        if end_time <= start_time:
+            raise ValueError("end_time must be greater than start_time")
+
+        with self.__arm_motor_info_high_spd_mtx:
+            self.__arm_motor_info_high_spd.Hz = self.__fps_counter.cal_average(
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_1'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_2'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_3'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_4'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_5'),
+                self.__fps_counter.get_fps('ArmMotorDriverInfoHighSpd_6')
+            )
+            latest = copy.deepcopy(self.__arm_motor_info_high_spd)
+            motor_speeds = []
+            sample_counts = []
+            for index, history in enumerate(self.__arm_motor_speed_history, start=1):
+                latest_motor = getattr(latest, f"motor_{index}")
+                average, sample_count = _calculate_motor_speed_window_average(
+                    history,
+                    start_time,
+                    end_time,
+                    latest_motor.motor_speed,
+                )
+                motor_speeds.append(average)
+                sample_counts.append(sample_count)
+            return self.ArmMotorSpeedWindowAverage(
+                start_time=start_time,
+                end_time=end_time,
+                motor_speed=tuple(motor_speeds),
+                sample_count=tuple(sample_counts),
+                latest=latest,
+            )
     
     def GetMotorStates(self):
         '''
@@ -1822,6 +1973,14 @@ class C_PiperInterface_V2():
                 self.__arm_gripper_msgs.gripper_state.status_code = msg.gripper_feedback.status_code
             return self.__arm_gripper_msgs
     
+    def __AppendMotorSpeedSample(self, motor_index, timestamp, motor_speed):
+        history = self.__arm_motor_speed_history[motor_index]
+        sample = (float(timestamp), float(motor_speed))
+        if not history or sample[0] > history[-1][0]:
+            history.append(sample)
+        elif sample[0] == history[-1][0]:
+            history[-1] = sample
+
     def __UpdateDriverInfoHighSpdFeedback(self, msg:PiperMessage):
         '''更新驱动器信息反馈, 高速
 
@@ -1837,48 +1996,60 @@ class C_PiperInterface_V2():
             if(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_1):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_1")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_1.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_1.can_id = msg.arm_high_spd_feedback_1.can_id
                 self.__arm_motor_info_high_spd.motor_1.motor_speed = msg.arm_high_spd_feedback_1.motor_speed
+                self.__AppendMotorSpeedSample(0, msg.time_stamp, msg.arm_high_spd_feedback_1.motor_speed)
                 self.__arm_motor_info_high_spd.motor_1.current = msg.arm_high_spd_feedback_1.current
                 self.__arm_motor_info_high_spd.motor_1.pos = msg.arm_high_spd_feedback_1.pos
                 self.__arm_motor_info_high_spd.motor_1.effort = msg.arm_high_spd_feedback_1.cal_effort()
             elif(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_2):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_2")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_2.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_2.can_id = msg.arm_high_spd_feedback_2.can_id
                 self.__arm_motor_info_high_spd.motor_2.motor_speed = msg.arm_high_spd_feedback_2.motor_speed
+                self.__AppendMotorSpeedSample(1, msg.time_stamp, msg.arm_high_spd_feedback_2.motor_speed)
                 self.__arm_motor_info_high_spd.motor_2.current = msg.arm_high_spd_feedback_2.current
                 self.__arm_motor_info_high_spd.motor_2.pos = msg.arm_high_spd_feedback_2.pos
                 self.__arm_motor_info_high_spd.motor_2.effort = msg.arm_high_spd_feedback_2.cal_effort()
             elif(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_3):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_3")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_3.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_3.can_id = msg.arm_high_spd_feedback_3.can_id
                 self.__arm_motor_info_high_spd.motor_3.motor_speed = msg.arm_high_spd_feedback_3.motor_speed
+                self.__AppendMotorSpeedSample(2, msg.time_stamp, msg.arm_high_spd_feedback_3.motor_speed)
                 self.__arm_motor_info_high_spd.motor_3.current = msg.arm_high_spd_feedback_3.current
                 self.__arm_motor_info_high_spd.motor_3.pos = msg.arm_high_spd_feedback_3.pos
                 self.__arm_motor_info_high_spd.motor_3.effort = msg.arm_high_spd_feedback_3.cal_effort()
             elif(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_4):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_4")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_4.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_4.can_id = msg.arm_high_spd_feedback_4.can_id
                 self.__arm_motor_info_high_spd.motor_4.motor_speed = msg.arm_high_spd_feedback_4.motor_speed
+                self.__AppendMotorSpeedSample(3, msg.time_stamp, msg.arm_high_spd_feedback_4.motor_speed)
                 self.__arm_motor_info_high_spd.motor_4.current = msg.arm_high_spd_feedback_4.current
                 self.__arm_motor_info_high_spd.motor_4.pos = msg.arm_high_spd_feedback_4.pos
                 self.__arm_motor_info_high_spd.motor_4.effort = msg.arm_high_spd_feedback_4.cal_effort()
             elif(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_5):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_5")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_5.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_5.can_id = msg.arm_high_spd_feedback_5.can_id
                 self.__arm_motor_info_high_spd.motor_5.motor_speed = msg.arm_high_spd_feedback_5.motor_speed
+                self.__AppendMotorSpeedSample(4, msg.time_stamp, msg.arm_high_spd_feedback_5.motor_speed)
                 self.__arm_motor_info_high_spd.motor_5.current = msg.arm_high_spd_feedback_5.current
                 self.__arm_motor_info_high_spd.motor_5.pos = msg.arm_high_spd_feedback_5.pos
                 self.__arm_motor_info_high_spd.motor_5.effort = msg.arm_high_spd_feedback_5.cal_effort()
             elif(msg.type_ == ArmMsgType.PiperMsgHighSpdFeed_6):
                 self.__fps_counter.increment("ArmMotorDriverInfoHighSpd_6")
                 self.__arm_motor_info_high_spd.time_stamp = msg.time_stamp
+                self.__arm_motor_info_high_spd.motor_6.time_stamp = msg.time_stamp
                 self.__arm_motor_info_high_spd.motor_6.can_id = msg.arm_high_spd_feedback_6.can_id
                 self.__arm_motor_info_high_spd.motor_6.motor_speed = msg.arm_high_spd_feedback_6.motor_speed
+                self.__AppendMotorSpeedSample(5, msg.time_stamp, msg.arm_high_spd_feedback_6.motor_speed)
                 self.__arm_motor_info_high_spd.motor_6.current = msg.arm_high_spd_feedback_6.current
                 self.__arm_motor_info_high_spd.motor_6.pos = msg.arm_high_spd_feedback_6.pos
                 self.__arm_motor_info_high_spd.motor_6.effort = msg.arm_high_spd_feedback_6.cal_effort()
