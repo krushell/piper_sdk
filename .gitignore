@@ -8,3 +8,4 @@ __pycache__
 piper_sdk.egg-info
 dist
 build
+logs
