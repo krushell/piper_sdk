@@ -16,6 +16,8 @@ from typing import Iterable, Sequence
 from piper_sdk import C_PiperInterface_V2, C_PiperForwardKinematics
 import torch
 from piper_sdk.deployment import math_utils
+from piper_sdk.deployment.policy import ManipulationPolicy
+
 # 关节限位
 JOINT_LIMITS_RAD = (
     (math.radians(-150.0), math.radians(150.0)),
@@ -58,28 +60,19 @@ ACTION_SCALE = 0.25
 SIMULATION_DT = 0.005
 SIMULATION_DECIMATION = 4
 POLICY_CONTROL_PERIOD = SIMULATION_DT * SIMULATION_DECIMATION
-SINGLE_OBSERVATION_DIM = 27
-OBS_HISTORY_LENGTH = 5
+
 SPEED_PERCENT = 5
 MOTION_TIMEOUT = 25.0
 TARGET_REACHED_KEYPOINT_ERROR_M = 0.02
+CAN_CONTROL_READY_TIMEOUT = 2.0
+CAN_CONTROL_STABLE_SAMPLES = 5
+JOINT_FEEDBACK_TIMEOUT = 0.5
+# J2/J3 的机械零位反馈可能略微越过名义边界。该容差只用于检查当前反馈，
+# 不会放宽发送给机械臂的目标关节限位。
+INITIAL_JOINT_LIMIT_TOLERANCE_DEG = 5.0
 
 
-class ArmPolicy(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(SINGLE_OBSERVATION_DIM * OBS_HISTORY_LENGTH, 512),
-            torch.nn.ELU(),
-            torch.nn.Linear(512, 256),
-            torch.nn.ELU(),
-            torch.nn.Linear(256, 128),
-            torch.nn.ELU(),
-            torch.nn.Linear(128, 6),
-        )
 
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        return self.mlp(observation)
 
 
 class Manipulation:
@@ -91,15 +84,18 @@ class Manipulation:
         target_pos_b: Sequence[float] | torch.Tensor | None = DEFAULT_TARGET_POS_B,
     )->None:
         self.device = torch.device(device)
-        self.arm_policy: ArmPolicy | None = None
+        self.arm_policy =  ManipulationPolicy(device=self.device)
         self.checkpoint_path: Path | None = None
         if checkpoint_path is not None:
-            self.load_arm_policy(checkpoint_path)
+            self.arm_policy.load_policy(checkpoint_path)
 
         self.piper = C_PiperInterface_V2(can_name)
         self.fk = C_PiperForwardKinematics(dh_is_offset=1)
         self.control_started = False
+        self._enable_attempted = False
+        self.initialized = False
         self.target_init_joint = [math.degrees(angle) for angle in POLICY_INIT_JOINT_POS]
+        # 检查初始目标位置是否越界
         for index, (angle, limits) in enumerate(
                 zip(self.target_init_joint, JOINT_LIMITS_DEG), start=1
             ):
@@ -111,7 +107,7 @@ class Manipulation:
                     )
         try:
             self.piper.ConnectPort()
-            # 等待3s 关节和机械臂状态反馈，避免读取 SDK 的初始零值。
+            # 等待3s 关节和机械臂状态反馈
             feedback_deadline = time.monotonic() + 3.0
             while True:
                 joint_msg = self.piper.GetArmJointMsgs()
@@ -124,17 +120,17 @@ class Manipulation:
                 time.sleep(0.02)
 
             self.reset()
-            # self.check_zero_link6()
-            
+            # self.check_zero_link6() # 检查实机的link6位置是否与urdf一致
+
         except KeyboardInterrupt:
-            print("用户中断")
-            if self.control_started:
+            if self._enable_attempted:
                 self.quick_stop()
+            raise
         except Exception as e:
-            print(f"初始化机械臂失败：{e}")
-            if self.control_started:
+            if self._enable_attempted:
                 self.quick_stop()
-        
+            raise RuntimeError(f"初始化机械臂失败：{e}") from e
+
         self.arm_joint_pos = torch.zeros(6, dtype=torch.float32,device=self.device)
         self.arm_joint_vel = torch.zeros(6, dtype=torch.float32,device=self.device)
         self.arm_last_action = torch.zeros(6, dtype=torch.float32,device=self.device)
@@ -146,6 +142,7 @@ class Manipulation:
         self.arm_joint_limits_rad = torch.tensor(
             JOINT_LIMITS_RAD, dtype=torch.float32, device=self.device
         )
+
         self._next_observation_deadline: float | None = None
         self._previous_joint_feedback_timestamp_s: float | None = None
         self.motor_speed_average_start_timestamp_s = 0.0
@@ -153,12 +150,12 @@ class Manipulation:
         self.motor_speed_average_window_s = POLICY_CONTROL_PERIOD
         self.motor_speed_average_sample_counts = (0,) * 6
         self.motor_speed_latest_rad_s = (0.0,) * 6
-        self.target_pos_b = torch.zeros(3, dtype=torch.float32,device=self.device)
+        # 目标位置
         self.pose_command_b = torch.zeros(7, dtype=torch.float32,device=self.device)
         self.current_ee_pose_b = torch.zeros_like(self.pose_command_b)
         self.current_ee_pose_b[3] = 1.0
         self.pose_command_b[3] = 1.0
-        half_keypoint_side = 0.05
+        half_keypoint_side = 0.05 # 姿态控制权重
         self.keypoint_offsets_ee = torch.tensor(
             (
                 (half_keypoint_side, 0.0, 0.0),
@@ -173,10 +170,10 @@ class Manipulation:
         self.keypoint_error_command_b = torch.zeros(9, dtype=torch.float32,device=self.device)
 
         self.arm_current_obs_buf = torch.zeros(
-            SINGLE_OBSERVATION_DIM, dtype=torch.float32, device=self.device
+            self.arm_policy.cfg.ObsCfg.num_single_observations, dtype=torch.float32, device=self.device
         )
         self.arm_history_obs_buf = torch.zeros(
-            SINGLE_OBSERVATION_DIM * OBS_HISTORY_LENGTH,
+            self.arm_policy.cfg.ObsCfg.num_observations,
             dtype=torch.float32,
             device=self.device,
         )
@@ -184,71 +181,12 @@ class Manipulation:
 
         self.set_arm_command(target_pos_b)
         self.update_feedback_observation()
+        self.initialized = True
 
-    def load_arm_policy(self, checkpoint_path: str | Path) -> None:
-        path = Path(checkpoint_path).expanduser()
-        if not path.is_absolute():
-            path = (Path.cwd() / path).resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Policy checkpoint not found: {path}")
-
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        if not isinstance(checkpoint, dict) or "actor_state_dict" not in checkpoint:
-            raise KeyError(f"Checkpoint does not contain actor_state_dict: {path}")
-        actor_state = checkpoint["actor_state_dict"]
-        if not isinstance(actor_state, dict):
-            raise TypeError("actor_state_dict must be a mapping of tensor names to tensors")
-
-        actor = ArmPolicy().to(self.device)
-        expected_keys = set(actor.state_dict())
-        mlp_state = {
-            key: value for key, value in actor_state.items() if key.startswith("mlp.")
-        }
-        missing_keys = expected_keys - set(mlp_state)
-        unexpected_keys = set(mlp_state) - expected_keys
-        unsupported_keys = set(actor_state) - set(mlp_state) - {"distribution.std_param"}
-        if missing_keys or unexpected_keys or unsupported_keys:
-            raise RuntimeError(
-                "Policy architecture does not match the deployment actor: "
-                f"missing={sorted(missing_keys)}, "
-                f"unexpected={sorted(unexpected_keys)}, "
-                f"unsupported={sorted(unsupported_keys)}"
-            )
-
-        actor.load_state_dict(mlp_state, strict=True)
-        actor.eval().requires_grad_(False)
-        self.arm_policy = actor
-        self.checkpoint_path = path
-
-    def get_action(
-        self, observation: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        if self.arm_policy is None:
-            raise RuntimeError("Arm policy is not loaded")
-
-        if observation is None:
-            if not self._arm_history_initialized:
-                raise RuntimeError("Arm observation history is not initialized")
-            observation = self.arm_history_obs_buf
-        observation = torch.as_tensor(
-            observation, dtype=torch.float32, device=self.device
-        )
-        if observation.shape == (SINGLE_OBSERVATION_DIM * OBS_HISTORY_LENGTH,):
-            observation = observation.unsqueeze(0)
-        expected_shape = (1, SINGLE_OBSERVATION_DIM * OBS_HISTORY_LENGTH)
-        if observation.shape != expected_shape:
-            raise ValueError(
-                f"Expected observation shape {expected_shape} or "
-                f"({expected_shape[1]},), got {observation.shape}."
-            )
-
-        with torch.inference_mode():
-            action = self.arm_policy(observation)
-        if action.shape != (1, 6):
-            raise RuntimeError(f"Expected policy action shape (1, 6), got {action.shape}.")
-        return action
 
     def run_policy(self, num_steps: int | None = None) -> None:
+        if not self.initialized:
+            raise RuntimeError("机械臂尚未成功初始化，禁止运行 policy")
         if self.arm_policy is None:
             raise RuntimeError("Arm policy is not loaded")
         if num_steps is not None and num_steps < 1:
@@ -256,7 +194,7 @@ class Manipulation:
 
         step_count = 0
         while num_steps is None or step_count < num_steps:
-            action = self.get_action()
+            action = self.arm_policy.get_action(self.arm_history_obs_buf)
             self.step(action)
             step_count += 1
 
@@ -435,7 +373,6 @@ class Manipulation:
             math_utils.quat_mul(reference_quat, local_quat)
         )
 
-        self.target_pos_b.copy_(target_pos)
         self.pose_command_b[:3].copy_(target_pos)
         self.pose_command_b[3:].copy_(target_quat)
         self.target_keypoints_b.copy_(
@@ -445,6 +382,8 @@ class Manipulation:
         )
 
     def apply_action(self, action: torch.Tensor) -> None:
+        if not self.initialized:
+            raise RuntimeError("机械臂尚未成功初始化，禁止发送 policy 动作")
         action = torch.as_tensor(
             action, dtype=self.arm_last_action.dtype, device=self.device
         )
@@ -455,7 +394,7 @@ class Manipulation:
                 f"Expected action shape (6,) or (1, 6), got {action.shape}."
             )
         if not torch.isfinite(action).all():
-            raise ValueError("Action must contain only finite values.")
+            raise ValueError("Policy action must contain only finite values")
         self.arm_last_action.copy_(torch.clamp(action, -ACTION_CLIP, ACTION_CLIP))
         self.arm_joint_pos_target.copy_(
             self.default_arm_joint_pos + ACTION_SCALE * self.arm_last_action
@@ -471,21 +410,58 @@ class Manipulation:
         status_msg = self.piper.GetArmStatus()
         if joint_msg.Hz <= 0 or status_msg.Hz <= 0:
             raise RuntimeError("CAN 反馈频率为零")
+        self._validate_joint_feedback(joint_msg, context="policy 控制")
         arm_status = status_msg.arm_status.arm_status
-        if int(arm_status) != 0:
-            raise RuntimeError(f"机械臂状态异常：{arm_status}")
-
-        target_millideg = (
+        arm_ctrl_mode = status_msg.arm_status.ctrl_mode
+        if int(arm_status) != 0 or int(arm_ctrl_mode) != 0x01:
+            raise RuntimeError(
+                "policy 控制前机械臂状态异常："
+                f"{self._arm_status_diagnostics(status_msg)}"
+            )
+        # 将弧度动作 转为角度 并乘1000
+        self.target_millideg = (
             torch.rad2deg(self.arm_joint_pos_target)
             .mul(1000.0)
             .round()
             .to(dtype=torch.int64, device="cpu")
             .tolist()
         )
-        # Piper keeps the MOVE J target in its internal servo loop.  At the
-        # policy rate we only need to refresh it once, not once per sim substep.
-        self.piper.MotionCtrl_2(0x01, 0x01, SPEED_PERCENT, 0x00)
-        self.piper.JointCtrl(*target_millideg)
+        # self.piper.MotionCtrl_2(ctrl_mode=0x01,move_mode=0x01,move_spd_rate_ctrl=SPEED_PERCENT,is_mit_mode=0x00)
+        # self.piper.JointCtrl(*self.target_millideg)
+
+        # send_start = time.monotonic()
+        # target = tuple(self.target_millideg)
+        # for i in range(SIMULATION_DECIMATION):
+        #     deadline = send_start + i * SIMULATION_DT
+        #     remaining = deadline - time.monotonic()
+        #     if remaining > 0:
+        #         time.sleep(remaining)
+        #     self.piper.JointCtrl(*target)
+
+        self.mit_control()
+
+    def mit_control(self) -> None:
+        actions =self.arm_joint_pos_target.detach().cpu().tolist()
+        self.piper.MotionCtrl_2(ctrl_mode=0x01,move_mode=0x04,move_spd_rate_ctrl=0,is_mit_mode=0xAD)
+        for i in range(1,4):
+            self.piper.JointMitCtrl(
+                motor_num=i,
+                vel_ref=0.0,
+                pos_ref = actions[i-1],
+                kp=2,
+                kd=1,
+                t_ref=0.0,
+            )
+        for i in range(4,7):
+            self.piper.JointMitCtrl(
+                motor_num=i,
+                vel_ref=0.0,
+                pos_ref = actions[i-1],
+                kp=1,
+                kd=0.8,
+                t_ref=0.0,
+            )
+
 
     def wait_for_policy_period(self) -> None:
         now = time.monotonic()
@@ -494,7 +470,6 @@ class Manipulation:
         else:
             deadline = self._next_observation_deadline + POLICY_CONTROL_PERIOD
             if deadline <= now:
-                # Do not issue catch-up commands faster than the trained rate.
                 deadline = now + POLICY_CONTROL_PERIOD
         self._next_observation_deadline = deadline
 
@@ -503,6 +478,7 @@ class Manipulation:
             time.sleep(remaining)
 
     def step(self, action: torch.Tensor) -> torch.Tensor:
+        # 裁剪策略动作 并转为角度 交给机械臂控制
         self.apply_action(action)
         self.wait_for_policy_period()
         self.update_feedback_observation()
@@ -583,7 +559,7 @@ class Manipulation:
 
     def update_arm_history_obs(self) -> None:
         history = self.arm_history_obs_buf.view(
-            OBS_HISTORY_LENGTH, SINGLE_OBSERVATION_DIM
+            self.arm_policy.cfg.ObsCfg.obs_history_length, self.arm_policy.cfg.ObsCfg.num_single_observations
         )
         if not self._arm_history_initialized:
             history.copy_(
@@ -604,11 +580,6 @@ class Manipulation:
                 self.keypoint_error_command_b,
             )
         )
-        if current_observation.shape != (SINGLE_OBSERVATION_DIM,):
-            raise RuntimeError(
-                f"Expected {SINGLE_OBSERVATION_DIM} observations, "
-                f"got {current_observation.shape}."
-            )
         self.arm_current_obs_buf.copy_(current_observation)
 
     def check_zero_link6(self) -> None:
@@ -650,83 +621,220 @@ class Manipulation:
         print(f"link6 零位位置差: {position_error_mm:.4f} mm")        
 
 
+    @staticmethod
+    def _joint_positions_deg(joint_msg: object) -> list[float]:
+        joint_state = joint_msg.joint_state
+        return [
+            getattr(joint_state, f"joint_{index}") / 1000.0
+            for index in range(1, 7)
+        ]
+
+    @staticmethod
+    def _arm_status_diagnostics(status_msg: object) -> str:
+        arm_status = status_msg.arm_status
+        err_status = arm_status.err_status
+        communication_joints = [
+            f"J{index}"
+            for index in range(1, 7)
+            if getattr(err_status, f"communication_status_joint_{index}", False)
+        ]
+        angle_limit_joints = [
+            f"J{index}"
+            for index in range(1, 7)
+            if getattr(err_status, f"joint_{index}_angle_limit", False)
+        ]
+        communication_text = ",".join(communication_joints) or "无"
+        angle_limit_text = ",".join(angle_limit_joints) or "无"
+        err_code = int(arm_status.err_code) & 0xFFFF
+        return (
+            f"status={arm_status.arm_status}, ctrl_mode={arm_status.ctrl_mode}, "
+            f"err_code=0x{err_code:04X}, 通信异常关节={communication_text}, "
+            f"角度超限关节={angle_limit_text}"
+        )
+
+    def _validate_joint_feedback(
+        self,
+        joint_msg: object,
+        *,
+        context: str,
+        warn_near_limit: bool = False,
+    ) -> list[float]:
+        current_joint_deg = self._joint_positions_deg(joint_msg)
+        violations = []
+        near_limit = []
+        for index, (current, limits) in enumerate(
+            zip(current_joint_deg, JOINT_LIMITS_DEG), start=1
+        ):
+            lower, upper = limits
+            if not math.isfinite(current):
+                violations.append(f"J{index}=非有限值")
+            elif not (
+                lower - INITIAL_JOINT_LIMIT_TOLERANCE_DEG
+                <= current
+                <= upper + INITIAL_JOINT_LIMIT_TOLERANCE_DEG
+            ):
+                violations.append(
+                    f"J{index}={current:.3f}° "
+                    f"(允许启动范围 "
+                    f"[{lower - INITIAL_JOINT_LIMIT_TOLERANCE_DEG:.1f}, "
+                    f"{upper + INITIAL_JOINT_LIMIT_TOLERANCE_DEG:.1f}]°)"
+                )
+            elif not lower <= current <= upper:
+                near_limit.append(
+                    f"J{index}={current:.3f}° (名义范围 [{lower:.1f}, {upper:.1f}]°)"
+                )
+
+        if violations:
+            raise RuntimeError(
+                f"{context}关节反馈严重越界：{'；'.join(violations)}。"
+                "禁止发送运动指令；请保持失能并检查零点/编码器圈数。"
+            )
+        if warn_near_limit and near_limit:
+            print(
+                "警告：启动关节反馈略超名义边界，已按 "
+                f"{INITIAL_JOINT_LIMIT_TOLERANCE_DEG:.1f}° 容差放行："
+                + "；".join(near_limit)
+            )
+        return current_joint_deg
+
+    def _wait_for_can_control_ready(self) -> None:
+        deadline = time.monotonic() + CAN_CONTROL_READY_TIMEOUT
+        stable_samples = 0
+        last_timestamp: float | None = None
+        last_diagnostics = "尚未收到新状态帧"
+
+        while time.monotonic() <= deadline:
+            self.piper.MotionCtrl_2(0x01, 0x01, SPEED_PERCENT, 0x00)
+            status_msg = self.piper.GetArmStatus()
+            if status_msg.Hz <= 0:
+                stable_samples = 0
+                last_diagnostics = "机械臂状态反馈频率为零"
+                time.sleep(0.005)
+                continue
+
+            timestamp = float(status_msg.time_stamp)
+            if timestamp == last_timestamp:
+                time.sleep(0.002)
+                continue
+            last_timestamp = timestamp
+            arm_status = status_msg.arm_status.arm_status
+            ctrl_mode = status_msg.arm_status.ctrl_mode
+            last_diagnostics = self._arm_status_diagnostics(status_msg)
+
+            if int(arm_status) == 0 and int(ctrl_mode) == 0x01:
+                stable_samples += 1
+                if stable_samples >= CAN_CONTROL_STABLE_SAMPLES:
+                    return
+            else:
+                stable_samples = 0
+                # 使能/模式切换时允许通信状态短暂过渡，但其它故障立即停止。
+                if int(arm_status) not in (0, 0x05):
+                    raise RuntimeError(
+                        "切换 CAN 控制模式时机械臂状态异常："
+                        f"{last_diagnostics}"
+                    )
+            time.sleep(0.005)
+
+        raise RuntimeError(
+            "等待 NORMAL + CAN_CTRL 稳定状态超时："
+            f"{last_diagnostics}"
+        )
+
     # 重置机械臂到初始位置
-    def reset(self)->None:
-        try:
+    def reset(self) -> None:
+        joint_msg = self.piper.GetArmJointMsgs()
+        status_msg = self.piper.GetArmStatus()
+        if joint_msg.Hz <= 0 or status_msg.Hz <= 0:
+            raise RuntimeError("CAN 反馈频率为零")
+
+        current_joint_deg = self._validate_joint_feedback(
+            joint_msg,
+            context="启动前",
+            warn_near_limit=True,
+        )
+        if int(status_msg.arm_status.arm_status) != 0:
+            raise RuntimeError(
+                "机械臂启动前状态异常："
+                f"{self._arm_status_diagnostics(status_msg)}"
+            )
+        print(
+            "启动关节反馈(°): "
+            + "[" + ", ".join(f"{value:.3f}" for value in current_joint_deg) + "]"
+        )
+
+        self._enable_attempted = True
+        enable_deadline = time.monotonic() + 5.0
+        while not self.piper.EnablePiper():
+            if time.monotonic() > enable_deadline:
+                enable_status = self.piper.GetArmEnableStatus()
+                raise RuntimeError(
+                    "机械臂使能超时："
+                    f"enable_status={enable_status}, "
+                    f"{self._arm_status_diagnostics(self.piper.GetArmStatus())}"
+                )
+            time.sleep(0.01)
+        self.control_started = True
+
+        # 只切换控制模式，确认状态稳定后才允许发送任何关节目标。
+        self._wait_for_can_control_ready()
+
+        target_millideg = [
+            round(angle * 1000) for angle in self.target_init_joint
+        ]
+        motion_deadline = time.monotonic() + MOTION_TIMEOUT
+        joint_msg = self.piper.GetArmJointMsgs()
+        last_feedback_timestamp = joint_msg.time_stamp
+        last_feedback_time = time.monotonic()
+
+        while True:
+            self.piper.MotionCtrl_2(0x01, 0x01, SPEED_PERCENT, 0x00)
+            self.piper.JointCtrl(*target_millideg)
+            # 等待一轮控制周期，确保下面检查的是发送命令后的新反馈。
+            time.sleep(POLICY_CONTROL_PERIOD)
+
             joint_msg = self.piper.GetArmJointMsgs()
             status_msg = self.piper.GetArmStatus()
+            now = time.monotonic()
+
+            if joint_msg.time_stamp != last_feedback_timestamp:
+                last_feedback_timestamp = joint_msg.time_stamp
+                last_feedback_time = now
+            elif now - last_feedback_time > JOINT_FEEDBACK_TIMEOUT:
+                raise RuntimeError("关节状态反馈超时")
+
             if joint_msg.Hz <= 0 or status_msg.Hz <= 0:
                 raise RuntimeError("CAN 反馈频率为零")
-            arm_status = status_msg.arm_status.arm_status # 0x00字段表示状态正常
-            if int(arm_status) != 0:
-                raise RuntimeError(f"机械臂启动前状态异常：{arm_status}")
+            arm_status = status_msg.arm_status.arm_status
+            ctrl_mode = status_msg.arm_status.ctrl_mode
+            if int(arm_status) != 0 or int(ctrl_mode) != 0x01:
+                raise RuntimeError(
+                    "回零运动中机械臂状态异常："
+                    f"{self._arm_status_diagnostics(status_msg)}"
+                )
 
-            self.control_started = True
-            enable_timeout = time.monotonic() + 5.0
-            # 使能机械臂
-            while not self.piper.EnablePiper():
-                if time.monotonic() > enable_timeout:
-                    raise RuntimeError("机械臂使能超时")
-                time.sleep(0.01)
-            motion_timeout = time.monotonic() + MOTION_TIMEOUT
-            last_feedback_time_stamp = joint_msg.time_stamp
-            last_feedback_time = time.monotonic()
-            while True:
-                # 发送 运动模式的配置指令 使用CAN指令 MOVE J关节运动模式 设置速度百分比 使用位置速度模式
-                self.piper.MotionCtrl_2(0x01, 0x01, SPEED_PERCENT, 0x00)
-                
-                target = [round(angle * 1000) for angle in self.target_init_joint]
-                self.piper.JointCtrl(*target)
-
-                joint_msg = self.piper.GetArmJointMsgs()
-                status_msg = self.piper.GetArmStatus()
-                now = time.monotonic()
-
-                if joint_msg.time_stamp != last_feedback_time_stamp:
-                    last_feedback_time_stamp = joint_msg.time_stamp
-                    last_feedback_time = now
-                elif now - last_feedback_time > 0.5:
-                    raise RuntimeError("关节状态反馈超时")
-
-                if joint_msg.Hz <= 0 or status_msg.Hz <= 0:
-                    raise RuntimeError("CAN 反馈频率为零")
-                arm_status = status_msg.arm_status.arm_status # 0x00字段表示状态正常
-                arm_ctrl_mode = status_msg.arm_status.ctrl_mode # 0x01字段表示CAN 控制模式
-
-                if int(arm_status) != 0:
-                    raise RuntimeError(f"机械臂状态异常：{arm_status, arm_ctrl_mode}")
-                
-
-                current_joint_deg = [
-                    joint_msg.joint_state.joint_1 / 1000.0,
-                    joint_msg.joint_state.joint_2 / 1000.0,
-                    joint_msg.joint_state.joint_3 / 1000.0,
-                    joint_msg.joint_state.joint_4 / 1000.0,
-                    joint_msg.joint_state.joint_5 / 1000.0,
-                    joint_msg.joint_state.joint_6 / 1000.0,
-                ]
-
-                deg_error = [
-                    abs(current - target)
-                    for current, target in zip(current_joint_deg, self.target_init_joint)
-                ]
-                max_error = max(deg_error)
-                if max_error <= 0.5:
-                    print(f"机械臂初始化到目标关节位置成功，最大误差 {max_error:.3f}°")
-                    break
-                if now > motion_timeout:
-                    raise RuntimeError(
-                        f"关节运动超时"
-                    )
-                time.sleep(0.02)
-        except KeyboardInterrupt:
-            print("用户中断")
-            if self.control_started:
-                self.quick_stop()
-        except Exception as e:
-            print(f"初始化机械臂失败：{e}")
-            if self.control_started:
-                self.quick_stop()
+            current_joint_deg = self._validate_joint_feedback(
+                joint_msg,
+                context="回零运动中",
+            )
+            deg_error = [
+                abs(current - target)
+                for current, target in zip(
+                    current_joint_deg, self.target_init_joint
+                )
+            ]
+            max_error = max(deg_error)
+            if max_error <= 0.5:
+                print(
+                    "机械臂初始化到目标关节位置成功，"
+                    f"最大误差 {max_error:.3f}°"
+                )
+                return
+            if now > motion_deadline:
+                raise RuntimeError(
+                    "关节运动超时："
+                    f"current={current_joint_deg}, target={self.target_init_joint}, "
+                    f"max_error={max_error:.3f}°"
+                )
 
     
 
@@ -739,7 +847,10 @@ class Manipulation:
             except Exception as exc:
                 stop_errors.append(exc)
             time.sleep(0.01)
-    
+
+        self.control_started = False
+        self._enable_attempted = False
+        self.initialized = False
         if stop_errors:
             print(f"警告：快速急停指令发送失败：{stop_errors[-1]}")
 
@@ -801,12 +912,20 @@ if __name__ == "__main__":
     else:
         target_pos_b = DEFAULT_TARGET_POS_B
 
-    manipulation = Manipulation(
-        checkpoint_path=args.checkpoint_path,
-        device=args.device,
-        can_name=args.can_name,
-        target_pos_b=target_pos_b,
-    )
+    try:
+        manipulation = Manipulation(
+            checkpoint_path=args.checkpoint_path,
+            device=args.device,
+            can_name=args.can_name,
+            target_pos_b=target_pos_b,
+        )
+    except KeyboardInterrupt:
+        print("用户中断机械臂初始化", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1)
+
     if args.run_policy:
         try:
             manipulation.run_policy(
