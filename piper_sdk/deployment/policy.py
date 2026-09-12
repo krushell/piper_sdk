@@ -15,7 +15,7 @@ class ManipulationCfg:
             joint_vel: float = 1.0
             last_action: float = 1.0
 
-        obs_history_length: int = 5
+        obs_history_length: int = 30
         num_single_observations: int = 27
         num_observations: int = (
             num_single_observations * obs_history_length

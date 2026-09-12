@@ -648,7 +648,8 @@ class C_PiperInterface_V2():
                     can_name:str, 
                     bustype="socketcan", 
                     expected_bitrate:int=1000000,
-                    judge_flag:bool=False):
+                    judge_flag:bool=False,
+                    **bus_kwargs):
         '''
         创建can有关的接口
         
@@ -668,7 +669,15 @@ class C_PiperInterface_V2():
             judge_flag: Whether to check the CAN port during the instantiation of the class. In some cases, it should be set to False.
         '''
         try:
-            self.__arm_can=C_STD_CAN(can_name, bustype, expected_bitrate, judge_flag, False, self.ParseCANFrame)
+            self.__arm_can=C_STD_CAN(
+                can_name,
+                bustype,
+                expected_bitrate,
+                judge_flag,
+                False,
+                self.ParseCANFrame,
+                **bus_kwargs,
+            )
             self.__arm_can.Init()
         except Exception as e:
             self.logger.error(e)
@@ -790,16 +799,17 @@ class C_PiperInterface_V2():
                 return
             self.__connected = False
             self.__read_can_stop_event.set()
+            self.__can_monitor_stop_event.set()
 
-        if hasattr(self, 'can_deal_th') and self.__can_deal_th.is_alive():
+        if self.__can_deal_th is not None and self.__can_deal_th.is_alive():
             self.__can_deal_th.join(timeout=thread_timeout)  # 加入超时，避免无限阻塞
             if self.__can_deal_th.is_alive():
                 self.logger.warning("[DisconnectPort] The [ReadCan] thread failed to exit within the timeout period")
 
-        # if hasattr(self, 'can_monitor_th') and self.__can_monitor_th.is_alive():
-        #     self.__can_monitor_th.join(timeout=thread_timeout)
-        #     if self.__can_monitor_th.is_alive():
-        #         self.logger.warning("The CanMonitor thread failed to exit within the timeout period")
+        if self.__can_monitor_th is not None and self.__can_monitor_th.is_alive():
+            self.__can_monitor_th.join(timeout=thread_timeout)
+            if self.__can_monitor_th.is_alive():
+                self.logger.warning("The CanMonitor thread failed to exit within the timeout period")
 
         try:
             self.__arm_can.Close()  # 关闭 CAN 端口

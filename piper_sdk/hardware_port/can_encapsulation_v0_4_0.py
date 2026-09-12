@@ -4,7 +4,12 @@
 # 反馈码为100开头，反馈码总长为000000
 import can
 from can.message import Message
+from can.interfaces.socketcand.socketcand import (
+    SocketCanDaemonBus,
+    convert_ascii_message_to_can_message,
+)
 import platform
+import socket
 import time
 from threading import Timer
 import subprocess
@@ -19,6 +24,58 @@ from typing import (
     cast,
 )
 from enum import IntEnum, auto
+
+
+class _SocketCanDaemonBus(SocketCanDaemonBus):
+    """socketcand client whose handshake handles TCP message coalescing.
+
+    python-can 4.6.1 expects one ``recv`` call to contain exactly ``< ok >``.
+    A busy socketcand can legally return ``< ok >< frame ... >`` in one TCP
+    segment.  Preserve and queue the trailing CAN frames instead of rejecting
+    the connection.
+    """
+
+    def _expect_msg(self, expected):
+        receive_buffer_name = "_SocketCanDaemonBus__receive_buffer"
+        socket_name = "_SocketCanDaemonBus__socket"
+        tcp_tune_name = "_SocketCanDaemonBus__tcp_tune"
+        message_buffer_name = "_SocketCanDaemonBus__message_buffer"
+
+        receive_buffer = getattr(self, receive_buffer_name)
+        connection = getattr(self, socket_name)
+        while ">" not in receive_buffer:
+            chunk = connection.recv(256)
+            if not chunk:
+                raise can.CanError(
+                    f"socketcand closed while waiting for '{expected}'"
+                )
+            receive_buffer += chunk.decode("ascii")
+            if getattr(self, tcp_tune_name):
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+
+        response_end = receive_buffer.index(">") + 1
+        response = receive_buffer[:response_end]
+        trailing = receive_buffer[response_end:]
+        if response != expected:
+            raise can.CanError(f"Expected '{expected}' got: '{response}'")
+
+        queued_messages = getattr(self, message_buffer_name)
+        while trailing:
+            frame_start = trailing.find("<")
+            if frame_start == -1:
+                trailing = ""
+                break
+            frame_end = trailing.find(">", frame_start)
+            if frame_end == -1:
+                trailing = trailing[frame_start:]
+                break
+            frame_text = trailing[frame_start : frame_end + 1]
+            frame = convert_ascii_message_to_can_message(frame_text)
+            if frame is not None:
+                frame.channel = self.channel
+                queued_messages.append(frame)
+            trailing = trailing[frame_end + 1 :]
+        setattr(self, receive_buffer_name, trailing)
 
 class C_STD_CAN():
     '''
@@ -86,15 +143,20 @@ class C_STD_CAN():
                  expected_bitrate:int=1000000,
                  judge_flag:bool=True, 
                  auto_init:bool=True,
-                 callback_function: Callable = None) -> None:
+                 callback_function: Callable = None,
+                 **bus_kwargs) -> None:
         self.channel_name = channel_name
         self.bustype = bustype
         self.expected_bitrate = expected_bitrate
+        self.bus_kwargs = dict(bus_kwargs)
         self.rx_message:Optional[Message] = Message()   #创建消息接收类
         self.callback_function = callback_function  #接收回调函数
         self.recv_bus = None
         self.send_bus = None
-        self._share_bus_between_rx_tx = platform.system() in ("Windows", "Darwin")
+        self._share_bus_between_rx_tx = (
+            self.bustype == "socketcand"
+            or platform.system() in ("Windows", "Darwin")
+        )
         if(judge_flag):
             self.JudgeCanInfo()
         if(auto_init):
@@ -131,7 +193,7 @@ class C_STD_CAN():
                 pass
             self.recv_bus = None
             self.send_bus = None
-            return self.CAN_STATUS.INIT_CAN_BUS_OPENED_FAILED
+            raise
 
     def Close(self):
         '''关闭can总线
@@ -154,8 +216,21 @@ class C_STD_CAN():
             return self.CAN_STATUS.CLOSED_CAN_BUS_NOT_OPEN
 
     def _create_bus(self):
-        return can.interface.Bus(channel=self.channel_name, bustype=self.bustype, bitrate=self.expected_bitrate,
-                                 receive_own_messages=False, local_loopback=False)
+        bus_kwargs = dict(self.bus_kwargs)
+        if self.bustype == "socketcand":
+            return _SocketCanDaemonBus(
+                channel=self.channel_name,
+                **bus_kwargs,
+            )
+        if self.bustype == "socketcan":
+            bus_kwargs.setdefault("bitrate", self.expected_bitrate)
+            bus_kwargs.setdefault("receive_own_messages", False)
+            bus_kwargs.setdefault("local_loopback", False)
+        return can.interface.Bus(
+            channel=self.channel_name,
+            interface=self.bustype,
+            **bus_kwargs,
+        )
 
     def _shutdown_buses(self):
         if self.recv_bus is None and self.send_bus is None:
