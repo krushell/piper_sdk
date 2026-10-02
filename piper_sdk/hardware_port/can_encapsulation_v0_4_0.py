@@ -144,6 +144,7 @@ class C_STD_CAN():
                  judge_flag:bool=True, 
                  auto_init:bool=True,
                  callback_function: Callable = None,
+                 frame_observer: Optional[Callable] = None,
                  **bus_kwargs) -> None:
         self.channel_name = channel_name
         self.bustype = bustype
@@ -151,6 +152,9 @@ class C_STD_CAN():
         self.bus_kwargs = dict(bus_kwargs)
         self.rx_message:Optional[Message] = Message()   #创建消息接收类
         self.callback_function = callback_function  #接收回调函数
+        # observer(direction, message, local_start_ns, local_end_ns, result, error)
+        # Local times are monotonic; message.timestamp belongs to the CAN source.
+        self.frame_observer = frame_observer
         self.recv_bus = None
         self.send_bus = None
         self._share_bus_between_rx_tx = (
@@ -277,8 +281,16 @@ class C_STD_CAN():
         if(can_bus_status == self.CAN_STATUS.BUS_STATE_ACTIVE):
             try:
                 self.rx_message = self.recv_bus.recv(1)
-                if self.rx_message is None:
-                    return self.CAN_STATUS.READ_CAN_MSG_TIMEOUT
+                received_ns = time.monotonic_ns()
+            except Exception:
+                return self.CAN_STATUS.READ_CAN_MSG_FAILED
+            if self.rx_message is None:
+                return self.CAN_STATUS.READ_CAN_MSG_TIMEOUT
+            if self.frame_observer is not None:
+                self.frame_observer(
+                    "rx", self.rx_message, received_ns, received_ns, "received", ""
+                )
+            try:
                 if self.rx_message and self.callback_function:
                     self.callback_function(self.rx_message) #回调函数处理接收的原始数据
                 return self.CAN_STATUS.READ_CAN_MSG_OK
@@ -300,17 +312,23 @@ class C_STD_CAN():
                               data=data, 
                               dlc=dlc,
                               is_extended_id=is_extended_id)
+        started_ns = time.monotonic_ns()
+        error = ""
         if(self.is_can_bus_ok(self.send_bus) == self.CAN_STATUS.BUS_STATE_ACTIVE):
             try:
                 self.send_bus.send(message)
-                # return True
-                return self.CAN_STATUS.SEND_MESSAGE_SUCCESS
-            # except can.CanError:
-            #     return self.CAN_STATUS.SEND_MESSAGE_FAILED
+                result = self.CAN_STATUS.SEND_MESSAGE_SUCCESS
             except Exception as e:
-                return self.CAN_STATUS.SEND_MESSAGE_FAILED
+                result = self.CAN_STATUS.SEND_MESSAGE_FAILED
+                error = str(e)
         else:
-            return self.CAN_STATUS.SEND_CAN_BUS_NOT_OK
+            result = self.CAN_STATUS.SEND_CAN_BUS_NOT_OK
+        finished_ns = time.monotonic_ns()
+        if self.frame_observer is not None:
+            self.frame_observer(
+                "tx", message, started_ns, finished_ns, result.name, error
+            )
+        return result
 
     def is_can_bus_ok(self, bus=None) -> bool:
         '''

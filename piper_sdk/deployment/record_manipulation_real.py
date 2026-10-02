@@ -1,4 +1,4 @@
-"""Record one fixed-target Manipulation policy rollout on Piper to CSV."""
+"""Record a Piper rollout to CSV and its exact policy inputs to NPZ."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import csv
 import math
 import time
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
+import numpy as np
 import torch
 
 from piper_sdk.deployment.manipulation import (
@@ -26,13 +27,14 @@ class RecordingManipulation(Manipulation):
 
     def __init__(
         self,
-        checkpoint_path: str | Path,
+        checkpoint_path: str | Path | None,
         device: str,
         can_name: str,
         can_host: str,
         can_port: int,
         target_pos_b: Sequence[float] | None,
         policy_control_mode: Literal["move_j", "mit"],
+        can_frame_observer: Callable | None = None,
     ) -> None:
         self.joint_feedback_timestamp = 0.0
         self.joint_feedback_hz = 0.0
@@ -57,6 +59,7 @@ class RecordingManipulation(Manipulation):
             can_port=can_port,
             target_pos_b=target_pos_b,
             policy_control_mode=policy_control_mode,
+            can_frame_observer=can_frame_observer,
         )
 
     def update_feedback_observation(self) -> None:
@@ -214,6 +217,7 @@ def _csv_header() -> list[str]:
     header += [f"target_quat_{axis}" for axis in ("w", "x", "y", "z")]
     for prefix in (
         "action_raw",
+        "action_clipped",
         "action_applied",
         "joint_target",
         "joint_pos",
@@ -254,6 +258,9 @@ def _csv_header() -> list[str]:
         "move_mode",
         "motion_status",
     ]
+    for prefix in ("obs_joint_pos", "obs_joint_vel", "obs_last_action"):
+        header += [f"{prefix}_j{joint}" for joint in range(1, JOINT_COUNT + 1)]
+    header += [f"obs_keypoint_error_{index}" for index in range(9)]
     return header
 
 
@@ -286,6 +293,7 @@ def _run_and_record(
     arm: RecordingManipulation,
     writer: csv.writer,
     policy_steps: int,
+    policy_observations: list[np.ndarray],
 ) -> int:
     header_length = len(_csv_header())
     previous_joint_pos = arm.arm_joint_pos.clone()
@@ -295,9 +303,10 @@ def _run_and_record(
     rows_written = 0
 
     for step_index in range(policy_steps):
+        policy_observation = arm.arm_history_obs_buf.detach().clone()
         inference_start = time.monotonic()
         action_raw = (
-            arm.arm_policy.get_action(arm.arm_history_obs_buf).detach().clone()
+            arm.arm_policy.get_action(policy_observation).detach().clone()
         )
         command_start = time.monotonic()
         arm.step(action_raw)
@@ -315,6 +324,15 @@ def _run_and_record(
         position_error_m, orientation_error_rad, keypoint_rms_m = (
             _tracking_errors(arm)
         )
+        if arm.policy_control_mode == "move_j":
+            sent_joint_target = torch.tensor(
+                arm.target_millideg, dtype=torch.float32, device=arm.device
+            ) * (math.pi / 180000.0)
+        else:
+            sent_joint_target = arm.arm_joint_pos_target
+        sent_action = (sent_joint_target - arm.default_arm_joint_pos) / (
+            arm.arm_policy.cfg.ActionCfg.action_scale
+        )
 
         row: list[float | int] = [
             step_index + 1,
@@ -327,8 +345,9 @@ def _run_and_record(
         row += _values(arm.pose_command_b[:3])
         row += _values(arm.pose_command_b[3:])
         row += _values(action_raw.squeeze(0))
-        row += _values(arm.arm_command_action)
-        row += _values(arm.arm_joint_pos_target)
+        row += _values(arm.arm_last_action)
+        row += _values(sent_action)
+        row += _values(sent_joint_target)
         row += _values(arm.arm_joint_pos)
         row += _values(arm.arm_joint_vel)
         row += list(arm.motor_speed_latest_rad_s)
@@ -365,11 +384,13 @@ def _run_and_record(
             arm.move_mode,
             arm.motion_status,
         ]
+        row += _values(policy_observation[-arm.arm_current_obs_buf.numel():])
         if len(row) != header_length:
             raise RuntimeError(
                 f"CSV row has {len(row)} values, expected {header_length}."
             )
         writer.writerow(row)
+        policy_observations.append(policy_observation.cpu().numpy())
         rows_written += 1
 
         previous_joint_pos.copy_(arm.arm_joint_pos)
@@ -387,6 +408,7 @@ def main() -> None:
     rows_written = 0
     policy_completed_normally = False
     returned_to_default = False
+    policy_observations: list[np.ndarray] = []
     try:
         with args.output.open("x", newline="") as output_file:
             writer = csv.writer(output_file)
@@ -403,7 +425,9 @@ def main() -> None:
                 policy_control_mode=args.policy_control_mode,
             )
             try:
-                rows_written = _run_and_record(arm, writer, args.policy_steps)
+                rows_written = _run_and_record(
+                    arm, writer, args.policy_steps, policy_observations
+                )
                 policy_completed_normally = True
             except KeyboardInterrupt:
                 print("用户中断实机 policy 记录")
@@ -421,8 +445,17 @@ def main() -> None:
         raise FileExistsError(
             f"Output CSV already exists and was not overwritten: {args.output}"
         ) from exc
+    finally:
+        if policy_observations:
+            np.savez_compressed(
+                args.output.with_suffix(".npz"),
+                policy_observation=np.stack(policy_observations),
+            )
 
-    print(f"已记录 {rows_written} 个实机策略步: {args.output}")
+    print(
+        f"已记录 {rows_written} 个实机策略步: {args.output}; "
+        f"完整策略观测: {args.output.with_suffix('.npz')}"
+    )
 
 
 if __name__ == "__main__":

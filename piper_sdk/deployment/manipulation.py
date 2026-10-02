@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 from piper_sdk import C_PiperInterface_V2, C_PiperForwardKinematics
 import torch
 from piper_sdk.deployment import math_utils
@@ -101,6 +101,7 @@ class Manipulation:
         can_port: int = 29536,
         target_pos_b: Sequence[float] | torch.Tensor | None = DEFAULT_TARGET_POS_B,
         policy_control_mode: Literal["move_j", "mit"] = "move_j",
+        can_frame_observer: Callable | None = None,
     )->None:
         self.set_policy_control_mode(policy_control_mode)
         self.device = torch.device(device)
@@ -121,6 +122,7 @@ class Manipulation:
             host=can_host,
             port=can_port,
             tcp_tune=True,
+            frame_observer=can_frame_observer,
         )
         self.fk = C_PiperForwardKinematics(dh_is_offset=1)
         self.control_started = False
@@ -166,10 +168,12 @@ class Manipulation:
         except KeyboardInterrupt:
             if self._enable_attempted:
                 self.quick_stop()
+            self.piper.DisconnectPort(thread_timeout=1.5)
             raise
         except Exception as e:
             if self._enable_attempted:
                 self.quick_stop()
+            self.piper.DisconnectPort(thread_timeout=1.5)
             raise RuntimeError(f"初始化机械臂失败：{e}") from e
 
         self.arm_joint_pos = torch.zeros(6, dtype=torch.float32,device=self.device)
